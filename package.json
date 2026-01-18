@@ -1,5 +1,5 @@
 {
-  "name": "gitcommitmessage",
+  "name": "@solomonmarvel97/gitcommitmessage",
   "version": "0.3.0",
   "description": "Generate intelligent commit messages from git status using Google Gemini AI",
   "keywords": [
