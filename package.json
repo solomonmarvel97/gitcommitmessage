@@ -1,13 +1,15 @@
 {
   "name": "@solomonmarvel97/gitcommitmessage",
   "version": "0.3.0",
-  "description": "Generate intelligent commit messages from git status using Google Gemini AI",
+  "description": "Generate intelligent commit messages from git status using AI providers",
   "keywords": [
     "git",
     "commit",
     "commit-message",
     "ai",
     "gemini",
+    "groq",
+    "openrouter",
     "cli",
     "conventional-commits",
     "automation",

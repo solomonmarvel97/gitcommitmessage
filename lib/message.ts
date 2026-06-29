@@ -1,14 +1,15 @@
 // Commit message generation (AI + simple fallback)
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import * as https from 'https';
 import { APIError } from './errors';
 import { retry, plural } from './utils';
-import { getApiKey, getModel } from './config';
+import { getApiKey, getModel, getProvider } from './config';
 import { getCachedMessage, cacheMessage } from './cache';
 import { buildPromptFromTemplate } from './templates';
-import { withProgress } from './progress';
 import CONSTANTS from './constants';
 import Logger from './logger';
+import { ProviderId, getProviderDefinition } from './providers';
 
 export interface StatusSummary {
   branch: string | null;
@@ -42,6 +43,15 @@ export interface MessageOptions {
   simple?: boolean;
   verbose?: boolean;
   template?: string;
+}
+
+interface ChatCompletionResponse {
+  choices?: Array<{
+    message?: {
+      content?: string | Array<{ type?: string; text?: string }>;
+    };
+    text?: string;
+  }>;
 }
 
 // Parse git status porcelain v2 output
@@ -232,21 +242,164 @@ export function buildSimpleMessage(summary: StatusSummary, opts: MessageOptions)
   return bodyParts.length ? `${title}\n\n${bodyParts.join('\n')}` : title;
 }
 
-// Generate commit message using Gemini AI
-export async function generateWithGemini(
+function stripMarkdownCodeBlocks(message: string): string {
+  return message.replace(/^```[\w]*\n?/gm, '').replace(/\n?```$/gm, '').trim();
+}
+
+function isModelUnavailableError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return message.includes('404') ||
+    message.includes('not found') ||
+    message.includes('not supported') ||
+    message.includes('model_not_found') ||
+    message.includes('does not exist');
+}
+
+function isAuthError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return message.includes('401') ||
+    message.includes('403') ||
+    message.includes('api_key') ||
+    message.includes('api key') ||
+    message.includes('unauthorized') ||
+    message.includes('forbidden') ||
+    message.includes('invalid x-api-key');
+}
+
+function isQuotaError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return message.includes('429') ||
+    message.includes('quota') ||
+    message.includes('rate limit') ||
+    message.includes('rate_limit');
+}
+
+function postJson<T>(url: string, body: unknown, headers: Record<string, string>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const requestBody = JSON.stringify(body);
+    const req = https.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(requestBody).toString(),
+        ...headers
+      }
+    }, (res) => {
+      let responseBody = '';
+
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+      res.on('end', () => {
+        const statusCode = res.statusCode || 0;
+
+        if (statusCode < 200 || statusCode >= 300) {
+          reject(new Error(`${statusCode} ${res.statusMessage || 'API error'}: ${responseBody}`));
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(responseBody) as T);
+        } catch (error) {
+          reject(new Error(`Invalid JSON response: ${(error as Error).message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, () => {
+      req.destroy(new Error('API request timed out'));
+    });
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+async function generateWithGeminiModel(apiKey: string, model: string, prompt: string): Promise<string> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const geminiModel = genAI.getGenerativeModel({ model: model });
+
+  const result = await geminiModel.generateContent(prompt);
+  const response = await result.response;
+  return response.text().trim();
+}
+
+function extractChatCompletionMessage(response: ChatCompletionResponse): string {
+  const choice = response.choices?.[0];
+  const content = choice?.message?.content;
+
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => part.text || '')
+      .join('')
+      .trim();
+  }
+
+  if (typeof choice?.text === 'string') {
+    return choice.text.trim();
+  }
+
+  return '';
+}
+
+async function generateWithOpenAICompatibleProvider(
+  provider: ProviderId,
+  apiKey: string,
+  model: string,
+  prompt: string
+): Promise<string> {
+  const providerConfig = getProviderDefinition(provider);
+  if (!providerConfig.baseUrl) {
+    throw new APIError(`${providerConfig.name} does not support OpenAI-compatible chat completions.`, 'UNSUPPORTED_PROVIDER');
+  }
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiKey}`
+  };
+
+  if (provider === 'openrouter') {
+    headers['HTTP-Referer'] = 'https://github.com/solomonmarvel97/gitcommitmessage';
+    headers['X-Title'] = 'gitcommitmessage';
+  }
+
+  const response = await postJson<ChatCompletionResponse>(
+    `${providerConfig.baseUrl}/chat/completions`,
+    {
+      model,
+      messages: [
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 400
+    },
+    headers
+  );
+
+  return extractChatCompletionMessage(response);
+}
+
+// Generate commit message using the configured AI provider
+export async function generateWithAI(
   summary: StatusSummary,
   diff: string,
   files: string[],
   opts: MessageOptions,
   logger?: Logger
 ): Promise<string> {
-  const apiKey = getApiKey();
+  const provider = getProvider();
+  const providerConfig = getProviderDefinition(provider);
+  const apiKey = getApiKey(provider);
   if (!apiKey) {
-    throw new APIError('API key not configured. Run "gcm config --set" to set your API key.', 'NO_API_KEY');
+    throw new APIError(`${providerConfig.name} API key not configured. Run "gcm config set" to set your API key.`, 'NO_API_KEY');
   }
   
   // Check cache first
-  const cacheKey = diff || JSON.stringify(files);
+  const cacheKey = `${provider}:${diff || JSON.stringify(files)}`;
   const cachedMessage = getCachedMessage(cacheKey);
   if (cachedMessage) {
     if (logger) {
@@ -255,10 +408,12 @@ export async function generateWithGemini(
     return cachedMessage;
   }
   
-  const defaultModel = getModel(CONSTANTS.DEFAULT_MODELS[0]);
+  const defaultModel = getModel(providerConfig.defaultModels[0], provider);
   const requestedModel = defaultModel;
-  const modelsToTry = requestedModel ? [requestedModel, ...CONSTANTS.DEFAULT_MODELS] : CONSTANTS.DEFAULT_MODELS;
+  const modelsToTry = requestedModel ? [requestedModel, ...providerConfig.defaultModels] : providerConfig.defaultModels;
   const uniqueModels = [...new Set(modelsToTry)];
+  const templateName = opts.template || 'default';
+  const prompt = buildPromptFromTemplate(summary, diff, files, opts, templateName);
 
   let lastError: Error | null = null;
   
@@ -266,19 +421,12 @@ export async function generateWithGemini(
     for (const model of uniqueModels) {
       try {
         return await retry(async () => {
-          const genAI = new GoogleGenerativeAI(apiKey);
-          const geminiModel = genAI.getGenerativeModel({ model: model });
-
-          // Build prompt from template
-          const templateName = opts.template || 'default';
-          const prompt = buildPromptFromTemplate(summary, diff, files, opts, templateName);
-
-          const result = await geminiModel.generateContent(prompt);
-          const response = await result.response;
-          let message = response.text().trim();
+          let message = provider === 'gemini'
+            ? await generateWithGeminiModel(apiKey, model, prompt)
+            : await generateWithOpenAICompatibleProvider(provider, apiKey, model, prompt);
 
           // Strip markdown code blocks if present
-          message = message.replace(/^```[\w]*\n?/gm, '').replace(/\n?```$/gm, '').trim();
+          message = stripMarkdownCodeBlocks(message);
 
           if (!message) {
             throw new APIError('Generated message is empty', 'EMPTY_RESPONSE');
@@ -292,7 +440,7 @@ export async function generateWithGemini(
       } catch (error) {
         const err = error as Error;
         // Model not found? Try the next one
-        if (err.message.includes('404') || err.message.includes('not found') || err.message.includes('not supported')) {
+        if (isModelUnavailableError(err)) {
           if (logger) {
             logger.debug(`Model ${model} unavailable, trying next...`);
           }
@@ -301,11 +449,11 @@ export async function generateWithGemini(
         }
         
         // Other errors - bail out
-        if (err.message.includes('API_KEY') || (err as any).code === 'NO_API_KEY') {
-          throw new APIError('Invalid or missing API key. Get your API key from ' + CONSTANTS.GEMINI_API_KEY_URL, 'INVALID_API_KEY');
+        if (isAuthError(err) || (err as any).code === 'NO_API_KEY') {
+          throw new APIError(`Invalid or missing ${providerConfig.name} API key. Get your API key from ${providerConfig.apiKeyUrl}`, 'INVALID_API_KEY');
         }
-        if (err.message.includes('quota') || err.message.includes('rate limit')) {
-          throw new APIError('Gemini API quota exceeded or rate limited. Please try again later or use --simple flag.', 'QUOTA_EXCEEDED');
+        if (isQuotaError(err)) {
+          throw new APIError(`${providerConfig.name} API quota exceeded or rate limited. Please try again later or use --simple flag.`, 'QUOTA_EXCEEDED');
         }
         throw error;
       }
@@ -314,7 +462,7 @@ export async function generateWithGemini(
     // All models failed
     if (lastError) {
       throw new APIError(
-        `No available Gemini model found. Tried: ${uniqueModels.join(', ')}. Error: ${lastError.message}. You can set a specific model via GEMINI_MODEL environment variable or in config.`,
+        `No available ${providerConfig.name} model found. Tried: ${uniqueModels.join(', ')}. Error: ${lastError.message}. You can set a specific model via ${providerConfig.modelEnvVar} or GCM_MODEL environment variable, or in config.`,
         'MODEL_NOT_FOUND'
       );
     }
@@ -325,3 +473,5 @@ export async function generateWithGemini(
   // Always use progress indicator (the caller can control visibility)
   return await generateFn();
 }
+
+export const generateWithGemini = generateWithAI;

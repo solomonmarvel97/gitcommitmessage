@@ -1,10 +1,10 @@
 # gcm - Git Commit Message Generator
 
-A CLI tool that generates intelligent commit messages from git status using Google Gemini AI, with automatic fallback to simple message format. Features real-time progress indicators and comprehensive error handling.
+A CLI tool that generates intelligent commit messages from git status using AI providers, with automatic fallback to simple message format. Features real-time progress indicators and comprehensive error handling.
 
 ## Features
 
-- AI-powered commit message generation using Google Gemini
+- AI-powered commit message generation using Google Gemini, Groq, or OpenRouter
 - TypeScript codebase with full type safety
 - Intelligent caching for similar diffs
 - Custom commit message templates
@@ -35,39 +35,66 @@ export PATH="$(npm prefix -g)/bin:$PATH"
 
 Configuration is required before using AI-powered commit messages.
 
-1. Get a Google Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+1. Choose an AI provider and get an API key:
+   - Google Gemini: [Google AI Studio](https://aistudio.google.com/apikey)
+   - Groq: [Groq Console](https://console.groq.com/keys)
+   - OpenRouter: [OpenRouter Keys](https://openrouter.ai/settings/keys)
 2. Configure it:
    ```bash
    gcm config set
    ```
-3. Enter your API key when prompted
-4. Select a model from the list (or press Enter for default: `gemini-3-flash-preview`)
+3. Select a provider when prompted
+4. Enter your API key
+5. Select a model from the list or press Enter for the provider default
 
-The API key and model are stored in `~/.gcm/config.json`.
+The provider, API key, and model are stored in `~/.gcm/config.json`.
 
-Alternatively, use the environment variable:
+Alternatively, use environment variables:
 ```bash
+export GCM_PROVIDER="groq" # gemini, groq, or openrouter
 export GEMINI_API_KEY="your-api-key-here"
+export GROQ_API_KEY="your-api-key-here"
+export OPENROUTER_API_KEY="your-api-key-here"
 ```
 
 ## Configuration Commands
 
 ```bash
 gcm config show      # Show current configuration
-gcm config set       # Set or update API key and model (interactive prompt)
+gcm config set       # Set or update provider, API key, and model (interactive prompt)
 gcm config clear     # Clear stored configuration
 ```
 
 When running `gcm config set`, you'll be prompted for:
-1. **API Key** - Your Google Gemini API key
-2. **Model** - Choose from available models (default: `gemini-3-flash-preview`)
+1. **Provider** - Choose Google Gemini, Groq, or OpenRouter
+2. **API Key** - Your provider API key
+3. **Model** - Choose from available models or enter a custom model name
 
-Available models:
+Default provider models:
+
+Google Gemini:
 - `gemini-3-flash-preview` (default)
 - `gemini-3-pro-preview`
 - `gemini-1.5-flash`
 - `gemini-1.5-pro`
 - `gemini-pro`
+
+Groq:
+- `llama-3.3-70b-versatile` (default)
+- `llama-3.1-8b-instant`
+- `openai/gpt-oss-120b`
+- `openai/gpt-oss-20b`
+
+OpenRouter:
+- `openai/gpt-4o-mini` (default)
+- `anthropic/claude-3.5-haiku`
+- `meta-llama/llama-3.1-8b-instruct`
+
+Provider-specific model environment variables are supported:
+- `GEMINI_MODEL`
+- `GROQ_MODEL`
+- `OPENROUTER_MODEL`
+- `GCM_MODEL` for any provider
 
 ## Usage
 
@@ -131,7 +158,7 @@ modified: src/app.js, src/utils.js, README.md
 2. Parses `git status --porcelain=v2 -b` to detect file changes, branch info, and status
 3. Collects git diffs for changed files (up to 20 files, ~50KB limit) with progress feedback
 4. Checks cache for similar diffs to avoid redundant API calls
-5. If API key is configured, sends context to Google Gemini AI to generate a Conventional Commits formatted message (with progress indicator)
+5. If an API key is configured, sends context to the selected AI provider to generate a Conventional Commits formatted message (with progress indicator)
 6. Falls back to simple format if AI is unavailable or fails
 7. Uses retry logic with exponential backoff for API reliability
 8. All operations show visual progress indicators for better user experience
@@ -241,7 +268,7 @@ Simple format provides a summary:
 - Run `gcm config show` to verify your API key
 - Check API quota/rate limits
 - Use `--simple` flag to bypass AI
-- Set `GEMINI_API_KEY` environment variable as alternative
+- Set `GEMINI_API_KEY`, `GROQ_API_KEY`, or `OPENROUTER_API_KEY` as an alternative
 
 **No changes detected:**
 - Ensure you have staged or unstaged changes

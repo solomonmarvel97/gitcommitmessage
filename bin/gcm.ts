@@ -2,21 +2,36 @@
 import * as readline from 'readline';
 import { Command } from 'commander';
 import Logger from '../lib/logger';
-import { getApiKey, hasConfig, saveConfig, clearConfig, displayConfig, getConfig } from '../lib/config';
+import { hasApiKey, saveConfig, clearConfig, displayConfig } from '../lib/config';
 import { isInsideRepo, getStatus, getDiff, stageAll, commit } from '../lib/git';
-import { parseStatus, getChangedFiles, buildSimpleMessage, generateWithGemini, MessageOptions } from '../lib/message';
+import { parseStatus, getChangedFiles, buildSimpleMessage, generateWithAI, MessageOptions } from '../lib/message';
 import { ConfigError, GitError, APIError, ValidationError } from '../lib/errors';
 import { validateApiKey, maskString } from '../lib/utils';
 import { withProgress } from '../lib/progress';
-import CONSTANTS from '../lib/constants';
+import { DEFAULT_PROVIDER, ProviderId, getProviderDefinition, getProviderIds, normalizeProvider } from '../lib/providers';
 import * as packageJson from '../package.json';
 
 const program = new Command();
 
 program
   .name('gcm')
-  .description('Generate intelligent commit messages from git status using AI (Gemini)')
+  .description('Generate intelligent commit messages from git status using AI')
   .version(packageJson.version);
+
+function parseProviderSelection(input: string): ProviderId | null {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return DEFAULT_PROVIDER;
+  }
+
+  const providerIds = getProviderIds();
+  const byIndex = Number(trimmed);
+  if (Number.isInteger(byIndex) && byIndex >= 1 && byIndex <= providerIds.length) {
+    return providerIds[byIndex - 1];
+  }
+
+  return normalizeProvider(trimmed);
+}
 
 // Config subcommands
 const configCmd = program
@@ -31,6 +46,7 @@ configCmd
     const config = displayConfig();
     if (config.hasConfig) {
       console.log('✓ Configuration found');
+      console.log(`  Provider: ${config.provider}`);
       console.log(`  API Key: ${config.apiKey}`);
       console.log(`  Model: ${config.model}`);
       console.log('');
@@ -44,7 +60,7 @@ configCmd
 
 configCmd
   .command('set')
-  .description('Set or update your Gemini API key and model')
+  .description('Set or update your AI provider, API key, and model')
   .action(async () => {
     try {
       const rl = readline.createInterface({
@@ -60,8 +76,28 @@ configCmd
         });
       };
 
-      console.log('Please enter your Google Gemini API key.');
-      console.log(`Get one at: ${CONSTANTS.GEMINI_API_KEY_URL}`);
+      console.log('Select an AI provider:');
+      getProviderIds().forEach((providerId, index) => {
+        const providerConfig = getProviderDefinition(providerId);
+        const defaultMarker = providerId === DEFAULT_PROVIDER ? ' (default)' : '';
+        console.log(`  ${index + 1}. ${providerConfig.name} [${providerId}]${defaultMarker}`);
+      });
+      console.log('');
+
+      const providerInput = await question(`Provider (default: ${DEFAULT_PROVIDER}): `);
+      const provider = parseProviderSelection(providerInput);
+
+      if (!provider) {
+        rl.close();
+        console.error('Error: Invalid provider.');
+        process.exit(1);
+      }
+
+      const providerConfig = getProviderDefinition(provider);
+
+      console.log('');
+      console.log(`Please enter your ${providerConfig.name} API key.`);
+      console.log(`Get one at: ${providerConfig.apiKeyUrl}`);
       console.log('');
       
       const apiKey = await question('API Key: ');
@@ -80,18 +116,19 @@ configCmd
 
       console.log('');
       console.log('Available models:');
-      CONSTANTS.DEFAULT_MODELS.forEach((model) => {
+      providerConfig.defaultModels.forEach((model) => {
         console.log(`  • ${model}`);
       });
       console.log('');
       
-      const modelInput = await question(`Model name (default: ${CONSTANTS.DEFAULT_MODELS[0]}): `);
+      const modelInput = await question(`Model name (default: ${providerConfig.defaultModels[0]}): `);
       
       rl.close();
 
-      const model = modelInput || CONSTANTS.DEFAULT_MODELS[0];
+      const model = modelInput || providerConfig.defaultModels[0];
 
       const config = {
+        provider,
         apiKey: apiKey,
         model: model
       };
@@ -99,6 +136,7 @@ configCmd
       saveConfig(config);
       console.log('');
       console.log('✓ Configuration saved successfully!');
+      console.log(`  Provider: ${providerConfig.name}`);
       console.log(`  API Key: ${maskString(apiKey)}`);
       console.log(`  Model: ${model}`);
       console.log('');
@@ -149,12 +187,12 @@ program
 
     try {
       // Check if config is required (unless using --simple)
-      if (!opts.simple && !hasConfig() && !process.env.GEMINI_API_KEY) {
+      if (!opts.simple && !hasApiKey()) {
         console.error('Error: API key not configured.');
         console.error('');
         console.error('Before using AI-powered commit messages, you must configure your API key:');
-        console.error(`  1. Get your API key from: ${CONSTANTS.GEMINI_API_KEY_URL}`);
-        console.error('  2. Run: gcm config set');
+        console.error('  1. Run: gcm config set');
+        console.error('  2. Select a provider');
         console.error('  3. Enter your API key when prompted');
         console.error('');
         console.error('Alternatively, use --simple flag for basic message format without AI.');
@@ -193,9 +231,9 @@ program
       let message: string;
 
       // Check if we have API key (from config or env)
-      const hasApiKey = hasConfig() || !!process.env.GEMINI_API_KEY;
+      const hasConfiguredApiKey = hasApiKey();
 
-      if (opts.simple || !hasApiKey) {
+      if (opts.simple || !hasConfiguredApiKey) {
         // Use simple message format
         if (opts.verbose && !opts.simple) {
           logger.warn('API key not configured, using simple message format.');
@@ -216,7 +254,7 @@ program
           });
 
           message = await withProgress('Generating commit message with AI...', async () => {
-            return await generateWithGemini(summary, diff, files, opts, logger);
+            return await generateWithAI(summary, diff, files, opts, logger);
           });
         } catch (error) {
           if (error instanceof APIError) {
