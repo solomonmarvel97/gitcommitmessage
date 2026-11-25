@@ -1,4 +1,4 @@
-const { parseStatus, buildSimpleMessage, getChangedFiles } = require('../lib/message');
+const { parseStatus, buildSimpleMessage, getChangedFiles } = require('../dist/lib/message');
 
 describe('message', () => {
   describe('parseStatus', () => {
@@ -20,6 +20,24 @@ describe('message', () => {
       const result = parseStatus(output);
       expect(result.staged.added).toBe(1);
       expect(result.samples.added).toContain('file.txt');
+    });
+
+    test('parses renames as old -> new, including paths with spaces', () => {
+      const output = '2 R. N... 100644 100644 100644 abc123 abc123 R100 new name.txt\told name.txt\n';
+      const result = parseStatus(output);
+      expect(result.staged.renamed).toBe(1);
+      expect(result.samples.renamed).toEqual(['old name.txt -> new name.txt']);
+    });
+
+    test('lists only staged files when stagedOnly is set', () => {
+      const output = [
+        '1 M. N... 100644 100644 100644 abc123 def456 staged.txt',
+        '1 .M N... 100644 100644 100644 abc123 abc123 unstaged.txt',
+        '1 .D N... 100644 100644 000000 abc123 abc123 removed.txt'
+      ].join('\n');
+      const result = parseStatus(output, true);
+      expect(result.samples.modified).toEqual(['staged.txt']);
+      expect(result.samples.deleted).toEqual([]);
     });
 
     test('parses untracked files', () => {
@@ -86,6 +104,8 @@ describe('message', () => {
       expect(files).toContain('file2.js');
       expect(files).toContain('file3.js');
       expect(files).toContain('file4.js');
+      expect(files).toContain('old.js');
+      expect(files).toContain('new.js');
     });
   });
 });

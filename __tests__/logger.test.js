@@ -1,4 +1,4 @@
-const Logger = require('../lib/logger').default || require('../lib/logger');
+const Logger = require('../dist/lib/logger').default || require('../dist/lib/logger');
 
 describe('Logger', () => {
   let consoleErrorSpy;
@@ -38,9 +38,21 @@ describe('Logger', () => {
     expect(consoleErrorSpy).toHaveBeenCalledWith('DEBUG:', 'Test debug');
   });
 
-  test('respects log level - ERROR only logs errors', () => {
-    // Skip this test - logger level filtering works but test setup is complex
-    // The logger correctly filters by level in practice
-    expect(true).toBe(true);
+  test('ERROR level logs errors only', () => {
+    const logger = new Logger('ERROR');
+    logger.warn('w');
+    logger.info('i');
+    logger.debug('d');
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    logger.error('e');
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test('an unknown level behaves like INFO', () => {
+    const logger = new Logger('nonsense');
+    logger.debug('d');
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    logger.info('i');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('i');
   });
 });

@@ -4,7 +4,7 @@ A CLI tool that generates intelligent commit messages from git status using AI p
 
 ## Features
 
-- AI-powered commit message generation using Google Gemini, Groq, or OpenRouter
+- AI-powered commit messages from Gemini, Anthropic, OpenAI, xAI, Groq, or OpenRouter
 - TypeScript codebase with full type safety
 - Intelligent caching for similar diffs
 - Custom commit message templates
@@ -16,92 +16,52 @@ A CLI tool that generates intelligent commit messages from git status using AI p
 ## Installation
 
 ```bash
-npm link
+make install
 ```
 
-Ensure your global npm bin directory is in your PATH:
-
-```bash
-npm prefix -g
-```
-
-Add to your shell config (`~/.zshrc` or `~/.config/fish/config.fish`):
-
-```bash
-export PATH="$(npm prefix -g)/bin:$PATH"
-```
+This builds the project and links `gcm` and `gitcommitmessage` into `~/.bun/bin` if it exists, otherwise `~/.local/bin`. Use `make install BINDIR=/some/dir` to choose another folder, and make sure that folder is on your `PATH`. The links point at this checkout, so keep it in place.
 
 ## Setup
 
 Configuration is required before using AI-powered commit messages.
 
-1. Choose an AI provider and get an API key:
-   - Google Gemini: [Google AI Studio](https://aistudio.google.com/apikey)
-   - Groq: [Groq Console](https://console.groq.com/keys)
-   - OpenRouter: [OpenRouter Keys](https://openrouter.ai/settings/keys)
-2. Configure it:
-   ```bash
-   gcm config set
-   ```
-3. Select a provider when prompted
-4. Enter your API key
-5. Select a model from the list or press Enter for the provider default
+| Provider | id | API key variable | Get a key |
+|---|---|---|---|
+| Google Gemini | `gemini` (default) | `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/apikey) |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | [Claude Console](https://platform.claude.com/settings/keys) |
+| OpenAI | `openai` | `OPENAI_API_KEY` | [OpenAI Platform](https://platform.openai.com/api-keys) |
+| xAI (Grok) | `xai` | `XAI_API_KEY` | [xAI Console](https://console.x.ai) |
+| Groq | `groq` | `GROQ_API_KEY` | [Groq Console](https://console.groq.com/keys) |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | [OpenRouter Keys](https://openrouter.ai/settings/keys) |
 
-The provider, API key, and model are stored in `~/.gcm/config.json`.
+Run `gcm config set`, pick a provider, paste its key (input is hidden) and choose a model. Each provider keeps its own key and model in `~/.gcm/config.json`; the last one you set is active. A config file from 0.3.x is upgraded automatically.
 
-Alternatively, use environment variables:
+You can also use environment variables:
+
 ```bash
-export GCM_PROVIDER="groq" # gemini, groq, or openrouter
-export GEMINI_API_KEY="your-api-key-here"
-export GROQ_API_KEY="your-api-key-here"
-export OPENROUTER_API_KEY="your-api-key-here"
+export GCM_PROVIDER="anthropic"
+export ANTHROPIC_API_KEY="your-api-key-here"
 ```
+
+Models can be set with `--model`, the provider's `<NAME>_MODEL` variable (for example `ANTHROPIC_MODEL`), `GCM_MODEL`, or `gcm config set`. Anthropic defaults to `claude-opus-5-5`; `claude-haiku-5-5` is much cheaper.
 
 ## Configuration Commands
 
 ```bash
-gcm config show      # Show current configuration
-gcm config set       # Set or update provider, API key, and model (interactive prompt)
-gcm config clear     # Clear stored configuration
+gcm config show      # List configured providers (keys are masked)
+gcm config set       # Add or update a provider
+gcm config clear     # Remove all stored configuration
 ```
-
-When running `gcm config set`, you'll be prompted for:
-1. **Provider** - Choose Google Gemini, Groq, or OpenRouter
-2. **API Key** - Your provider API key
-3. **Model** - Choose from available models or enter a custom model name
-
-Default provider models:
-
-Google Gemini:
-- `gemini-3-flash-preview` (default)
-- `gemini-3-pro-preview`
-- `gemini-1.5-flash`
-- `gemini-1.5-pro`
-- `gemini-pro`
-
-Groq:
-- `llama-3.3-70b-versatile` (default)
-- `llama-3.1-8b-instant`
-- `openai/gpt-oss-120b`
-- `openai/gpt-oss-20b`
-
-OpenRouter:
-- `openai/gpt-4o-mini` (default)
-- `anthropic/claude-3.5-haiku`
-- `meta-llama/llama-3.1-8b-instruct`
-
-Provider-specific model environment variables are supported:
-- `GEMINI_MODEL`
-- `GROQ_MODEL`
-- `OPENROUTER_MODEL`
-- `GCM_MODEL` for any provider
 
 ## Usage
 
 ```bash
 gcm                    # Generate commit message for all changes
 gcm --staged           # Generate message for staged changes only
-gcm --commit           # Stage changes, show message, wait for confirmation, then commit
+gcm --commit           # Show the message, then commit, edit, regenerate or quit
+gcm -p openai          # Use another provider for this run
+gcm -m claude-haiku-5-5 -p anthropic
+gcm | pbcopy           # Only the message goes to stdout
 gcm --simple           # Use simple format without AI
 gcm --verbose          # Show verbose output
 gcm --help             # Show help message
@@ -110,7 +70,9 @@ gcm --help             # Show help message
 ### Options
 
 - `-s, --staged` - Only consider staged changes
-- `-c, --commit` - Stage all changes, show message, wait for Enter, then commit
+- `-c, --commit` - Show the message, then press Enter to commit, `e` to edit, `r` to regenerate or `q` to quit. Changes are staged when you commit (with `--staged`, only what is already staged is committed)
+- `-p, --provider <id>` - Provider for this run
+- `-m, --model <name>` - Model for this run
 - `--simple, --no-ai` - Use simple message format (no AI)
 - `-v, --verbose` - Show verbose output
 - `-h, --help` - Show help message
@@ -136,12 +98,19 @@ fix: resolve memory leak in data processing
 - Added proper cleanup in error paths
 ```
 
-Commit with confirmation:
-```bash
-$ gcm --commit
-[Generates message, stages all changes, shows message]
-Press Enter to commit, or Ctrl+C to cancel: 
+Commit with the action menu:
 ```
+$ gcm --commit
+ ◆ gcm  anthropic · claude-opus-5-5
+
+ ✓ 3 files  +42 −7  on dev
+
+ │ feat: add Anthropic and OpenAI support
+
+ [enter] commit   [e] edit   [r] regenerate   [q] quit
+```
+
+Colors turn off for pipes and when `NO_COLOR` is set.
 
 Simple mode (no AI):
 ```bash
@@ -154,14 +123,12 @@ modified: src/app.js, src/utils.js, README.md
 
 ## How It Works
 
-1. Shows progress indicator while analyzing git status
-2. Parses `git status --porcelain=v2 -b` to detect file changes, branch info, and status
-3. Collects git diffs for changed files (up to 20 files, ~50KB limit) with progress feedback
-4. Checks cache for similar diffs to avoid redundant API calls
-5. If an API key is configured, sends context to the selected AI provider to generate a Conventional Commits formatted message (with progress indicator)
-6. Falls back to simple format if AI is unavailable or fails
-7. Uses retry logic with exponential backoff for API reliability
-8. All operations show visual progress indicators for better user experience
+1. Parses `git status --porcelain=v2 -b` to detect file changes, branch info, and status
+2. Collects git diffs for changed files (up to 20 files, ~50KB limit)
+3. Checks the cache for the same provider, model and diff
+4. Sends the context to the selected provider for a Conventional Commits message
+5. Retries rate limits, server errors and network failures with exponential backoff
+6. Falls back to the simple format if AI fails
 
 ## Advanced Features
 
@@ -181,21 +148,13 @@ You can create custom commit message templates. Templates support variables and 
 
 Templates are stored in `~/.gcm/templates/`.
 
-### Progress Indicators
+### Progress
 
-Progress indicators are automatically shown for all operations:
-- Spinner animations for async operations (git status, file collection, AI generation)
-- Real-time feedback during command execution
-- Success checkmarks (✓) when operations complete
-
-Progress indicators appear for:
-- Analyzing git status
-- Collecting changed files
-- Collecting git diffs
-- Generating commit messages (AI or simple)
-- Staging changes (when using `--commit`)
+A spinner is shown while the message is generated. Status output goes to stderr and is not animated when piped.
 
 ## Development
+
+Run `make` to list tasks. The main ones are `make install`, `make check` (type check, lint, tests), `make deps`, `make pack` and `make tag`.
 
 ### Building
 
@@ -228,6 +187,9 @@ gcm/
 │   ├── config.ts       # Configuration management
 │   ├── git.ts          # Git operations
 │   ├── message.ts      # Message generation
+│   ├── providers/      # One adapter per provider API
+│   ├── ui.ts           # Colors and layout
+│   ├── prompt.ts       # Interactive input and editor
 │   ├── cache.ts        # Caching system
 │   ├── templates.ts    # Template management
 │   └── progress.ts     # Progress indicators
@@ -261,14 +223,14 @@ Simple format provides a summary:
 ## Troubleshooting
 
 **Command not found:**
-- Ensure npm global bin is in your PATH
-- Run `npm link` again if needed
+- Ensure the folder `make install` printed is in your PATH
+- Run `make install` again if needed
 
 **API errors:**
 - Run `gcm config show` to verify your API key
 - Check API quota/rate limits
 - Use `--simple` flag to bypass AI
-- Set `GEMINI_API_KEY`, `GROQ_API_KEY`, or `OPENROUTER_API_KEY` as an alternative
+- Or set the provider's API key variable (see Setup)
 
 **No changes detected:**
 - Ensure you have staged or unstaged changes
@@ -281,7 +243,7 @@ Simple format provides a summary:
 ## Technical Details
 
 - **Language**: TypeScript with strict type checking
-- **Runtime**: Node.js >= 16
+- **Runtime**: Node.js >= 20
 - **Testing**: Jest with comprehensive test coverage
 - **CI/CD**: GitHub Actions for automated testing and releases
 - **Architecture**: Modular design with separation of concerns
