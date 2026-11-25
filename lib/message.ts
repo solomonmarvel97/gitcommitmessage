@@ -1,14 +1,14 @@
 // Commit message generation (AI + simple fallback)
 
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { APIError } from './errors';
 import { retry, plural } from './utils';
-import { getApiKey, getModel } from './config';
+import { getApiKey, getModel, getProvider } from './config';
 import { getCachedMessage, cacheMessage } from './cache';
 import { buildPromptFromTemplate } from './templates';
-import { withProgress } from './progress';
 import CONSTANTS from './constants';
 import Logger from './logger';
+import { getProviderDefinition } from './providers';
+import { generate } from './providers/generate';
 
 export interface StatusSummary {
   branch: string | null;
@@ -42,10 +42,12 @@ export interface MessageOptions {
   simple?: boolean;
   verbose?: boolean;
   template?: string;
+  model?: string;
+  skipCache?: boolean;
 }
 
 // Parse git status porcelain v2 output
-export function parseStatus(output: string): StatusSummary {
+export function parseStatus(output: string, stagedOnly: boolean = false): StatusSummary {
   const lines = output.split(/\r?\n/).filter(Boolean);
   const summary: StatusSummary = {
     branch: null,
@@ -64,7 +66,7 @@ export function parseStatus(output: string): StatusSummary {
         summary.branch = line.slice('# branch.head '.length).trim();
       } else if (line.startsWith('# branch.ab ')) {
         const ab = line.slice('# branch.ab '.length).trim();
-        const m = ab.match(/\+(-?\d+)\s+\-(-?\d+)/);
+        const m = ab.match(/\+(-?\d+)\s+-(-?\d+)/);
         if (m) {
           summary.ahead = parseInt(m[1], 10) || 0;
           summary.behind = parseInt(m[2], 10) || 0;
@@ -99,9 +101,11 @@ export function parseStatus(output: string): StatusSummary {
       
       let filePath = parts[parts.length - 1];
       let origPath: string | null = null;
-      if (type === '2' && parts.length >= 3) {
-        origPath = parts[parts.length - 2];
-        filePath = parts[parts.length - 1];
+      if (type === '2') {
+        // Rename/copy lines end with "<score> <path>\t<origPath>"
+        const [entry, orig] = line.split('\t');
+        filePath = entry.split(' ').slice(9).join(' ');
+        origPath = orig || null;
       }
 
       // Staged changes
@@ -135,12 +139,12 @@ export function parseStatus(output: string): StatusSummary {
       // Unstaged changes
       if (worktreeStatus === 'M') {
         summary.unstaged.modified += 1;
-        if (summary.samples.modified.length < CONSTANTS.MAX_FILE_SAMPLES) {
+        if (!stagedOnly && summary.samples.modified.length < CONSTANTS.MAX_FILE_SAMPLES) {
           summary.samples.modified.push(filePath);
         }
       } else if (worktreeStatus === 'D') {
         summary.unstaged.deleted += 1;
-        if (summary.samples.deleted.length < CONSTANTS.MAX_FILE_SAMPLES) {
+        if (!stagedOnly && summary.samples.deleted.length < CONSTANTS.MAX_FILE_SAMPLES) {
           summary.samples.deleted.push(filePath);
         }
       }
@@ -232,96 +236,95 @@ export function buildSimpleMessage(summary: StatusSummary, opts: MessageOptions)
   return bodyParts.length ? `${title}\n\n${bodyParts.join('\n')}` : title;
 }
 
-// Generate commit message using Gemini AI
-export async function generateWithGemini(
+function stripMarkdownCodeBlocks(message: string): string {
+  return message.replace(/^```[\w]*\n?/gm, '').replace(/\n?```$/gm, '').trim();
+}
+
+type ErrorWithStatus = Error & { status?: number };
+
+function isModelUnavailableError(error: ErrorWithStatus): boolean {
+  return error.status === 404 ||
+    /model_not_found|model_decommissioned|decommissioned|model .*(not found|does not exist|not supported)/i.test(error.message);
+}
+
+// Only rate limits, server errors and network failures are worth retrying
+export function isRetryableError(error: ErrorWithStatus): boolean {
+  if (typeof error.status === 'number') {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  return /timed out|timeout|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket|network|connection error|empty/i.test(error.message);
+}
+
+// The model that will be tried first
+export function resolveModel(opts: MessageOptions = {}): string {
+  const provider = getProvider();
+  return opts.model || getModel(getProviderDefinition(provider).defaultModels[0], provider);
+}
+
+// Generate commit message using the configured AI provider
+export async function generateWithAI(
   summary: StatusSummary,
   diff: string,
   files: string[],
   opts: MessageOptions,
   logger?: Logger
 ): Promise<string> {
-  const apiKey = getApiKey();
+  const provider = getProvider();
+  const definition = getProviderDefinition(provider);
+  const apiKey = getApiKey(provider);
   if (!apiKey) {
-    throw new APIError('API key not configured. Run "gcm config --set" to set your API key.', 'NO_API_KEY');
+    throw new APIError(`${definition.name} API key not configured. Run "gcm config set" to set your API key.`, 'NO_API_KEY');
   }
-  
-  // Check cache first
-  const cacheKey = diff || JSON.stringify(files);
-  const cachedMessage = getCachedMessage(cacheKey);
-  if (cachedMessage) {
-    if (logger) {
-      logger.debug('Using cached commit message');
-    }
-    return cachedMessage;
-  }
-  
-  const defaultModel = getModel(CONSTANTS.DEFAULT_MODELS[0]);
-  const requestedModel = defaultModel;
-  const modelsToTry = requestedModel ? [requestedModel, ...CONSTANTS.DEFAULT_MODELS] : CONSTANTS.DEFAULT_MODELS;
-  const uniqueModels = [...new Set(modelsToTry)];
 
+  const requestedModel = resolveModel(opts);
+  const prompt = buildPromptFromTemplate(summary, diff, files, opts, opts.template || 'default');
+  const cacheKey = `${provider}:${requestedModel}:${prompt}`;
+
+  const cached = opts.skipCache ? null : getCachedMessage(cacheKey);
+  if (cached) {
+    logger?.debug('Using cached commit message');
+    return cached;
+  }
+
+  // A model passed on the command line is never silently swapped for another
+  const models = opts.model ? [opts.model] : [...new Set([requestedModel, ...definition.defaultModels])];
   let lastError: Error | null = null;
-  
-  const generateFn = async (): Promise<string> => {
-    for (const model of uniqueModels) {
-      try {
-        return await retry(async () => {
-          const genAI = new GoogleGenerativeAI(apiKey);
-          const geminiModel = genAI.getGenerativeModel({ model: model });
 
-          // Build prompt from template
-          const templateName = opts.template || 'default';
-          const prompt = buildPromptFromTemplate(summary, diff, files, opts, templateName);
-
-          const result = await geminiModel.generateContent(prompt);
-          const response = await result.response;
-          let message = response.text().trim();
-
-          // Strip markdown code blocks if present
-          message = message.replace(/^```[\w]*\n?/gm, '').replace(/\n?```$/gm, '').trim();
-
-          if (!message) {
-            throw new APIError('Generated message is empty', 'EMPTY_RESPONSE');
-          }
-
-          // Save to cache
-          cacheMessage(cacheKey, message);
-
-          return message;
-        }, CONSTANTS.API_RETRY_ATTEMPTS);
-      } catch (error) {
-        const err = error as Error;
-        // Model not found? Try the next one
-        if (err.message.includes('404') || err.message.includes('not found') || err.message.includes('not supported')) {
-          if (logger) {
-            logger.debug(`Model ${model} unavailable, trying next...`);
-          }
-          lastError = err;
-          continue;
+  for (const model of models) {
+    try {
+      const message = await retry(async () => {
+        const text = stripMarkdownCodeBlocks(await generate({ provider, model, apiKey, prompt }));
+        if (!text) {
+          throw new APIError('Generated message is empty', 'EMPTY_RESPONSE');
         }
-        
-        // Other errors - bail out
-        if (err.message.includes('API_KEY') || (err as any).code === 'NO_API_KEY') {
-          throw new APIError('Invalid or missing API key. Get your API key from ' + CONSTANTS.GEMINI_API_KEY_URL, 'INVALID_API_KEY');
-        }
-        if (err.message.includes('quota') || err.message.includes('rate limit')) {
-          throw new APIError('Gemini API quota exceeded or rate limited. Please try again later or use --simple flag.', 'QUOTA_EXCEEDED');
-        }
-        throw error;
+        return text;
+      }, CONSTANTS.API_RETRY_ATTEMPTS, CONSTANTS.API_RETRY_DELAY, isRetryableError);
+
+      if (model !== requestedModel) {
+        logger?.warn(`Model ${requestedModel} is unavailable; used ${model}.`);
       }
-    }
-    
-    // All models failed
-    if (lastError) {
-      throw new APIError(
-        `No available Gemini model found. Tried: ${uniqueModels.join(', ')}. Error: ${lastError.message}. You can set a specific model via GEMINI_MODEL environment variable or in config.`,
-        'MODEL_NOT_FOUND'
-      );
-    }
-    
-    throw new APIError('Failed to generate message with any available model.', 'GENERATION_FAILED');
-  };
+      cacheMessage(cacheKey, message);
+      return message;
+    } catch (error) {
+      const err = error as ErrorWithStatus;
 
-  // Always use progress indicator (the caller can control visibility)
-  return await generateFn();
+      if (isModelUnavailableError(err)) {
+        logger?.debug(`Model ${model} unavailable, trying next...`);
+        lastError = err;
+        continue;
+      }
+      if (err.status === 401 || err.status === 403) {
+        throw new APIError(`Invalid ${definition.name} API key. Get one at ${definition.apiKeyUrl}`, 'INVALID_API_KEY');
+      }
+      if (err.status === 429) {
+        throw new APIError(`${definition.name} rate limit or quota reached. Try again later or use --simple.`, 'QUOTA_EXCEEDED');
+      }
+      throw error;
+    }
+  }
+
+  throw new APIError(
+    `No available ${definition.name} model. Tried: ${models.join(', ')}. ${lastError?.message || ''} Set one with --model or ${definition.modelEnvVar}.`,
+    'MODEL_NOT_FOUND'
+  );
 }

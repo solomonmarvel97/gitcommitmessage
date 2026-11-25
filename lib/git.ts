@@ -69,3 +69,18 @@ export function commit(message: string): boolean {
   }
   return true;
 }
+
+// Lines added and removed in tracked files
+export function getDiffStats(stagedOnly: boolean = false): { insertions: number; deletions: number } {
+  const stats = { insertions: 0, deletions: 0 };
+  const sources = stagedOnly ? [['--cached']] : [['--cached'], []];
+
+  for (const source of sources) {
+    for (const row of runGit(['diff', '--numstat', ...source]).stdout.split('\n')) {
+      const [added, removed] = row.split('\t');
+      stats.insertions += Number(added) || 0; // binary files report "-"
+      stats.deletions += Number(removed) || 0;
+    }
+  }
+  return stats;
+}

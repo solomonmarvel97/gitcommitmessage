@@ -13,7 +13,7 @@ export class Logger {
   private verbose: boolean;
 
   constructor(level: LogLevel | string = 'INFO', verbose: boolean = false) {
-    this.level = LOG_LEVELS[level.toUpperCase() as LogLevel] || LOG_LEVELS.INFO;
+    this.level = LOG_LEVELS[level.toUpperCase() as LogLevel] ?? LOG_LEVELS.INFO;
     this.verbose = verbose;
   }
 

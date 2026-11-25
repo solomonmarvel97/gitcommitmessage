@@ -1,22 +1,43 @@
 #!/usr/bin/env node
-import * as readline from 'readline';
 import { Command } from 'commander';
 import Logger from '../lib/logger';
-import { getApiKey, hasConfig, saveConfig, clearConfig, displayConfig, getConfig } from '../lib/config';
-import { isInsideRepo, getStatus, getDiff, stageAll, commit } from '../lib/git';
-import { parseStatus, getChangedFiles, buildSimpleMessage, generateWithGemini, MessageOptions } from '../lib/message';
-import { ConfigError, GitError, APIError, ValidationError } from '../lib/errors';
+import { hasApiKey, saveConfig, clearConfig, displayConfig, loadStore, getProvider } from '../lib/config';
+import { isInsideRepo, getStatus, getDiff, getDiffStats, stageAll, commit } from '../lib/git';
+import { parseStatus, getChangedFiles, buildSimpleMessage, generateWithAI, resolveModel, MessageOptions, StatusSummary } from '../lib/message';
+import { GitError, ConfigError } from '../lib/errors';
 import { validateApiKey, maskString } from '../lib/utils';
 import { withProgress } from '../lib/progress';
-import CONSTANTS from '../lib/constants';
+import { DEFAULT_PROVIDER, ProviderId, getProviderDefinition, getProviderIds, normalizeProvider } from '../lib/providers';
+import { ask, askAction, editMessage } from '../lib/prompt';
+import * as ui from '../lib/ui';
 import * as packageJson from '../package.json';
 
 const program = new Command();
 
 program
   .name('gcm')
-  .description('Generate intelligent commit messages from git status using AI (Gemini)')
+  .description('Generate intelligent commit messages from git status using AI')
   .version(packageJson.version);
+
+// Accept a list number or a name; blank means the default
+function pick(input: string, choices: readonly string[], fallback: string): string {
+  if (!input) return fallback;
+  const index = Number(input);
+  return Number.isInteger(index) && index >= 1 && index <= choices.length ? choices[index - 1] : input;
+}
+
+function printChoices(choices: readonly string[], labels: readonly string[], current: string): void {
+  choices.forEach((choice, index) => {
+    const marker = choice === current ? ui.theme.dim(' (default)') : '';
+    ui.line(`   ${ui.theme.accent(String(index + 1))}  ${labels[index]}${marker}`);
+  });
+  ui.line();
+}
+
+function fail(message: string, hint?: string): never {
+  ui.error(message, hint);
+  process.exit(1);
+}
 
 // Config subcommands
 const configCmd = program
@@ -29,88 +50,56 @@ configCmd
   .description('Show current configuration')
   .action(() => {
     const config = displayConfig();
-    if (config.hasConfig) {
-      console.log('✓ Configuration found');
-      console.log(`  API Key: ${config.apiKey}`);
-      console.log(`  Model: ${config.model}`);
-      console.log('');
-      console.log('To update your API key, run: gcm config set');
-    } else {
-      console.log('No configuration found.');
-      console.log('Run: gcm config set');
-      process.exit(1);
+    if (!config.hasConfig) {
+      fail('No configuration found.', 'Run: gcm config set');
     }
+    ui.header('configuration');
+    for (const entry of config.entries) {
+      const marker = entry.active ? ui.theme.success('●') : ui.theme.dim('○');
+      ui.line(` ${marker} ${ui.theme.bold(entry.name)} ${ui.theme.dim(`[${entry.id}]`)}`);
+      ui.line(`     key    ${entry.apiKey}`);
+      ui.line(`     model  ${entry.model}`);
+    }
+    ui.line();
   });
 
 configCmd
   .command('set')
-  .description('Set or update your Gemini API key and model')
+  .description('Set or update your AI provider, API key, and model')
   .action(async () => {
     try {
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
+      const ids = getProviderIds();
+      const current = loadStore()?.provider || DEFAULT_PROVIDER;
 
-      const question = (prompt: string): Promise<string> => {
-        return new Promise((resolve) => {
-          rl.question(prompt, (answer) => {
-            resolve(answer.trim());
-          });
-        });
-      };
+      ui.header('setup');
+      printChoices(ids, ids.map((id) => `${getProviderDefinition(id).name} ${ui.theme.dim(`[${id}]`)}`), current);
 
-      console.log('Please enter your Google Gemini API key.');
-      console.log(`Get one at: ${CONSTANTS.GEMINI_API_KEY_URL}`);
-      console.log('');
-      
-      const apiKey = await question('API Key: ');
+      const provider = normalizeProvider(pick(await ask(` Provider (${current}): `), ids, current));
+      if (!provider) fail('Invalid provider.', `Choose one of: ${ids.join(', ')}`);
 
-      if (!apiKey) {
-        rl.close();
-        console.error('Error: API key cannot be empty.');
-        process.exit(1);
-      }
+      const definition = getProviderDefinition(provider);
+      const saved = loadStore()?.providers[provider];
 
-      if (!validateApiKey(apiKey)) {
-        rl.close();
-        console.error('Error: Invalid API key format.');
-        process.exit(1);
-      }
+      ui.line();
+      ui.line(` Get a key at ${ui.theme.accent(definition.apiKeyUrl)}`);
+      const keep = saved ? ' (enter keeps the saved key)' : '';
+      const apiKey = (await ask(` API key${keep}: `, { hidden: true })) || saved?.apiKey || '';
 
-      console.log('');
-      console.log('Available models:');
-      CONSTANTS.DEFAULT_MODELS.forEach((model) => {
-        console.log(`  • ${model}`);
-      });
-      console.log('');
-      
-      const modelInput = await question(`Model name (default: ${CONSTANTS.DEFAULT_MODELS[0]}): `);
-      
-      rl.close();
+      if (!apiKey) fail('API key cannot be empty.');
+      if (!validateApiKey(apiKey)) fail('Invalid API key format.');
 
-      const model = modelInput || CONSTANTS.DEFAULT_MODELS[0];
+      const models = definition.defaultModels;
+      const defaultModel = saved?.model || models[0];
+      ui.line();
+      printChoices(models, models, defaultModel);
+      const model = pick(await ask(` Model, number or name (${defaultModel}): `), models, defaultModel);
 
-      const config = {
-        apiKey: apiKey,
-        model: model
-      };
-
-      saveConfig(config);
-      console.log('');
-      console.log('✓ Configuration saved successfully!');
-      console.log(`  API Key: ${maskString(apiKey)}`);
-      console.log(`  Model: ${model}`);
-      console.log('');
-      console.log('You can now use gcm to generate AI-powered commit messages.');
+      saveConfig({ provider, apiKey, model });
+      ui.line();
+      ui.success(`Saved ${definition.name} · ${model} · ${maskString(apiKey)}`);
+      ui.line();
     } catch (error) {
-      if (error instanceof ValidationError || error instanceof ConfigError) {
-        console.error(`Error: ${error.message}`);
-      } else {
-        const err = error as Error;
-        console.error(`Error: ${err.message}`);
-      }
-      process.exit(1);
+      fail((error as Error).message);
     }
   });
 
@@ -119,180 +108,159 @@ configCmd
   .description('Clear stored configuration')
   .action(() => {
     try {
-      const cleared = clearConfig();
-      if (cleared) {
-        console.log('✓ Configuration cleared.');
+      if (clearConfig()) {
+        ui.success('Configuration cleared.');
       } else {
-        console.log('No configuration found.');
+        ui.line('No configuration found.');
       }
     } catch (error) {
-      const err = error as Error;
-      console.error(`Error: ${err.message}`);
-      process.exit(1);
+      fail((error as Error).message);
     }
   });
+
+interface CliOptions {
+  staged?: boolean;
+  commit?: boolean;
+  simple?: boolean;
+  ai?: boolean;
+  verbose?: boolean;
+  provider?: string;
+  model?: string;
+}
+
+// Show the message and act on the user's choice until they commit or quit
+async function confirmAndCommit(
+  first: string,
+  stagedOnly: boolean,
+  regenerate: () => Promise<string>
+): Promise<void> {
+  let message = first;
+  ui.commitMessage(message);
+
+  for (;;) {
+    const action = await askAction(ui.actionMenu());
+
+    if (action === 'quit') {
+      ui.warn('Nothing committed.');
+      return;
+    }
+    if (action === 'regenerate') {
+      message = await regenerate();
+      ui.commitMessage(message);
+      continue;
+    }
+    if (action === 'edit') {
+      const edited = editMessage(message);
+      if (edited) {
+        message = edited;
+      } else {
+        ui.warn('Empty message; kept the previous one.');
+      }
+      ui.commitMessage(message);
+      continue;
+    }
+
+    // With --staged, commit only what is already staged
+    if (!stagedOnly) stageAll();
+    commit(message);
+    ui.success('Committed.');
+    return;
+  }
+}
 
 // Main command
 program
   .option('-s, --staged', 'Only consider staged changes')
-  .option('-c, --commit', 'Stage changes, show message, wait for confirmation, then commit')
-  .option('--simple, --no-ai', 'Use simple message format (no AI)')
+  .option('-c, --commit', 'Show the message, then commit, edit, regenerate or quit')
+  .option('-p, --provider <id>', `Provider for this run (${getProviderIds().join(', ')})`)
+  .option('-m, --model <name>', 'Model for this run')
+  .option('--simple', 'Use simple message format (no AI)')
+  .option('--no-ai', 'Same as --simple')
   .option('-v, --verbose', 'Show verbose output')
-  .action(async (options: { staged?: boolean; commit?: boolean; simple?: boolean; verbose?: boolean }) => {
+  .action(async (options: CliOptions) => {
     const logger = new Logger('INFO', options.verbose || false);
     const opts: MessageOptions = {
       stagedOnly: options.staged || false,
       commit: options.commit || false,
-      simple: options.simple || false,
-      verbose: options.verbose || false
+      simple: options.simple || options.ai === false,
+      verbose: options.verbose || false,
+      model: options.model
     };
 
     try {
-      // Check if config is required (unless using --simple)
-      if (!opts.simple && !hasConfig() && !process.env.GEMINI_API_KEY) {
-        console.error('Error: API key not configured.');
-        console.error('');
-        console.error('Before using AI-powered commit messages, you must configure your API key:');
-        console.error(`  1. Get your API key from: ${CONSTANTS.GEMINI_API_KEY_URL}`);
-        console.error('  2. Run: gcm config set');
-        console.error('  3. Enter your API key when prompted');
-        console.error('');
-        console.error('Alternatively, use --simple flag for basic message format without AI.');
-        process.exit(1);
+      if (options.provider) {
+        const provider = normalizeProvider(options.provider);
+        if (!provider) fail(`Unknown provider "${options.provider}".`, `Choose one of: ${getProviderIds().join(', ')}`);
+        process.env.GCM_PROVIDER = provider;
       }
 
-      // Check if we're in a git repo
+      const provider: ProviderId = getProvider();
+      if (!opts.simple && !hasApiKey(provider)) {
+        const definition = getProviderDefinition(provider);
+        fail(
+          `No ${definition.name} API key configured.`,
+          `Run "gcm config set", set ${definition.apiKeyEnvVar}, or use --simple.`
+        );
+      }
+
       if (!isInsideRepo()) {
-        console.error('Error: Not a git repository');
-        console.error('Run this command from within a git repository.');
-        process.exit(1);
+        fail('Not a git repository.', 'Run this command from within a git repository.');
       }
 
-      // Get git status with progress
-      const statusOutput = await withProgress('Analyzing git status...', async () => {
-        return Promise.resolve(getStatus());
-      });
-      const summary = parseStatus(statusOutput);
+      const summary: StatusSummary = parseStatus(getStatus(), opts.stagedOnly);
 
-      // Check if there are any changes
-      const hasChanges = summary.staged.added + summary.staged.modified + summary.staged.deleted +
-        summary.staged.renamed + summary.staged.copied > 0 ||
-        (!opts.stagedOnly && (
-          summary.unstaged.modified + summary.unstaged.deleted +
-          summary.untracked > 0
-        ));
+      const stagedCount = summary.staged.added + summary.staged.modified + summary.staged.deleted +
+        summary.staged.renamed + summary.staged.copied;
+      const otherCount = opts.stagedOnly ? 0 :
+        summary.unstaged.modified + summary.unstaged.deleted + summary.untracked;
 
-      if (!hasChanges) {
-        const msg = opts.stagedOnly
-          ? 'No staged changes to commit.'
-          : 'No changes detected. Working tree is clean.';
-        console.log(msg);
-        process.exit(0);
+      if (stagedCount + otherCount === 0) {
+        ui.line(opts.stagedOnly ? 'No staged changes to commit.' : 'No changes detected. Working tree is clean.');
+        return;
       }
 
-      let message: string;
+      const files = getChangedFiles(summary, opts.stagedOnly || false);
+      const stats = getDiffStats(opts.stagedOnly);
 
-      // Check if we have API key (from config or env)
-      const hasApiKey = hasConfig() || !!process.env.GEMINI_API_KEY;
+      ui.header(opts.simple ? 'simple mode' : `${provider} · ${resolveModel(opts)}`);
+      ui.changeStats(files.length, stats.insertions, stats.deletions, summary.branch);
 
-      if (opts.simple || !hasApiKey) {
-        // Use simple message format
-        if (opts.verbose && !opts.simple) {
-          logger.warn('API key not configured, using simple message format.');
-          logger.info('Run "gcm config set" to configure your API key.');
-        }
-        message = await withProgress('Generating commit message...', async () => {
-          return Promise.resolve(buildSimpleMessage(summary, opts));
-        });
-      } else {
-        // Use AI to generate message
+      const build = async (skipCache: boolean = false): Promise<string> => {
+        if (opts.simple) return buildSimpleMessage(summary, opts);
         try {
-          const files = await withProgress('Collecting changed files...', async () => {
-            return Promise.resolve(getChangedFiles(summary, opts.stagedOnly || false));
-          });
-
-          const diff = await withProgress('Collecting git diffs...', async () => {
-            return Promise.resolve(getDiff(files, opts.stagedOnly || false));
-          });
-
-          message = await withProgress('Generating commit message with AI...', async () => {
-            return await generateWithGemini(summary, diff, files, opts, logger);
-          });
+          const diff = getDiff(files, opts.stagedOnly || false);
+          return await withProgress('Writing commit message...', () =>
+            generateWithAI(summary, diff, files, { ...opts, skipCache }, logger));
         } catch (error) {
-          if (error instanceof APIError) {
-            logger.error(`Error generating AI message: ${error.message}`);
-          } else {
-            const err = error as Error;
-            logger.error(`Error generating AI message: ${err.message}`);
-          }
-          if (opts.verbose) {
-            logger.info('Falling back to simple message format...');
-          }
-          message = await withProgress('Generating simple commit message...', async () => {
-            return Promise.resolve(buildSimpleMessage(summary, opts));
-          });
+          ui.error((error as Error).message, 'Using the simple format instead.');
+          return buildSimpleMessage(summary, opts);
         }
-      }
+      };
 
-      console.log(message);
+      const message = await build();
 
       if (opts.commit) {
-        // Stage all changes first
-        await withProgress('Staging all changes...', async () => {
-          stageAll();
-          return Promise.resolve();
-        });
-
-        // Show the commit message and wait for user confirmation
-        console.log('');
-        console.log('Generated commit message:');
-        console.log('─'.repeat(72));
-        console.log(message);
-        console.log('─'.repeat(72));
-        console.log('');
-
-        const rl = readline.createInterface({
-          input: process.stdin,
-          output: process.stdout
-        });
-
-        await new Promise<void>((resolve) => {
-          rl.question('Press Enter to commit, or Ctrl+C to cancel: ', () => {
-            rl.close();
-
-            if (opts.verbose) {
-              logger.info('Committing changes...');
-            }
-            commit(message);
-            resolve();
-          });
-        });
+        await confirmAndCommit(message, opts.stagedOnly || false, () => build(true));
+      } else {
+        ui.commitMessage(message);
       }
     } catch (error) {
-      if (error instanceof GitError) {
-        logger.error(`Git error: ${error.message}`);
-      } else if (error instanceof ConfigError) {
-        logger.error(`Config error: ${error.message}`);
-      } else {
-        const err = error as Error;
-        logger.error(`Error: ${err.message}`);
-      }
+      const err = error as Error;
+      const prefix = error instanceof GitError ? 'Git error: ' : error instanceof ConfigError ? 'Config error: ' : '';
       if (process.env.DEBUG) {
-        const err = error as Error;
         console.error(err.stack);
       }
-      process.exit(1);
+      fail(`${prefix}${err.message}`);
     }
   });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (error: unknown) => {
   const err = error as Error;
-  console.error('Unhandled error:', err.message);
   if (process.env.DEBUG) {
     console.error(err.stack);
   }
-  process.exit(1);
+  fail(`Unhandled error: ${err.message}`);
 });
 
 program.parse(process.argv);

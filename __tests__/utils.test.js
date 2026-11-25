@@ -1,4 +1,4 @@
-const { validateApiKey, maskString, plural, truncate } = require('../lib/utils');
+const { validateApiKey, maskString, plural, truncate, retry } = require('../dist/lib/utils');
 
 describe('utils', () => {
   describe('validateApiKey', () => {
@@ -46,6 +46,22 @@ describe('utils', () => {
 
     test('does not truncate short strings', () => {
       expect(truncate('short', 50)).toBe('short');
+    });
+  });
+
+  describe('retry', () => {
+    const failing = () => jest.fn().mockRejectedValue(new Error('boom'));
+
+    test('stops after the maximum attempts', async () => {
+      const fn = failing();
+      await expect(retry(fn, 3, 0)).rejects.toThrow('boom');
+      expect(fn).toHaveBeenCalledTimes(3);
+    });
+
+    test('does not retry when told not to', async () => {
+      const fn = failing();
+      await expect(retry(fn, 3, 0, () => false)).rejects.toThrow('boom');
+      expect(fn).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -1,4 +1,4 @@
-const { GCMError, ConfigError, GitError, APIError, ValidationError } = require('../lib/errors');
+const { GCMError, ConfigError, GitError, APIError, ValidationError } = require('../dist/lib/errors');
 
 describe('errors', () => {
   describe('GCMError', () => {

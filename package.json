@@ -1,28 +1,34 @@
 {
-  "name": "gitcommitmessage",
-  "version": "0.3.0",
-  "description": "Generate intelligent commit messages from git status using Google Gemini AI",
+  "name": "@solomonmarvel97/gitcommitmessage",
+  "version": "0.4.0",
+  "description": "Write git commit messages with Gemini, Anthropic, OpenAI, xAI, Groq or OpenRouter",
   "keywords": [
     "git",
     "commit",
     "commit-message",
-    "ai",
-    "gemini",
-    "cli",
     "conventional-commits",
-    "automation",
+    "ai",
+    "cli",
+    "gemini",
+    "anthropic",
+    "claude",
+    "openai",
+    "grok",
+    "xai",
+    "groq",
+    "openrouter",
     "developer-tools"
   ],
   "author": "Marvelous Solomon",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/solomonmarvel97/gitcommitmessage"
+    "url": "git+https://github.com/solomonmarvel97/gitcommitmessage.git"
   },
   "bugs": {
     "url": "https://github.com/solomonmarvel97/gitcommitmessage/issues"
   },
-  "homepage": "solomonmarvel.com/gitcommitmessage",
+  "homepage": "https://solomonmarvel.com/gitcommitmessage",
   "bin": {
     "gcm": "dist/bin/gcm.js",
     "gitcommitmessage": "dist/bin/gcm.js"
@@ -36,18 +42,22 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "lint": "eslint . || true",
-    "type-check": "tsc --noEmit || true",
-    "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "lint": "eslint bin lib --ext .ts",
+    "type-check": "tsc --noEmit",
+    "build": "npm run clean && tsc",
+    "prepublishOnly": "npm run type-check && npm run lint && npm test",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "pretest": "npm run build",
+    "pretest:coverage": "npm run build"
   },
   "type": "commonjs",
   "main": "dist/bin/gcm.js",
   "engines": {
-    "node": ">=16"
+    "node": ">=20"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
+    "@anthropic-ai/sdk": "^1.14.0",
+    "chalk": "^4.1.2",
     "commander": "^11.1.0"
   },
   "devDependencies": {
@@ -62,13 +72,19 @@
   },
   "jest": {
     "testEnvironment": "node",
-    "moduleNameMapper": {
-      "^../lib/(.*)$": "<rootDir>/dist/lib/$1"
-    },
-    "coveragePathIgnorePatterns": [
+    "setupFilesAfterEnv": [
+      "<rootDir>/__tests__/helpers/temp-home.js"
+    ],
+    "testPathIgnorePatterns": [
       "/node_modules/",
-      "/lib/",
-      "/dist/"
+      "/__tests__/helpers/"
+    ],
+    "collectCoverageFrom": [
+      "dist/bin/**/*.js",
+      "dist/lib/**/*.js"
     ]
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

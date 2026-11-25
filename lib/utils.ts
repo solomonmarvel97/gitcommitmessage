@@ -47,7 +47,8 @@ export function isInsideRepo(): boolean {
 export async function retry<T>(
   fn: () => Promise<T>,
   maxAttempts: number = CONSTANTS.API_RETRY_ATTEMPTS,
-  delay: number = CONSTANTS.API_RETRY_DELAY
+  delay: number = CONSTANTS.API_RETRY_DELAY,
+  shouldRetry: (error: Error) => boolean = () => true
 ): Promise<T> {
   let lastError: Error | undefined;
   
@@ -60,6 +61,9 @@ export async function retry<T>(
       // Don't retry validation/config errors
       if (err instanceof Error && ('code' in err) && 
           (err.code === 'VALIDATION_ERROR' || err.code === 'CONFIG_ERROR')) {
+        throw error;
+      }
+      if (!shouldRetry(err)) {
         throw error;
       }
       
@@ -81,8 +85,8 @@ export function validateApiKey(apiKey: unknown): boolean {
   }
   
   const trimmed = apiKey.trim();
-  // Just check for reasonable length (Gemini keys are usually ~39 chars)
-  return trimmed.length >= 20 && trimmed.length <= 200;
+  // Just check for reasonable length (some project keys are well over 100 chars)
+  return trimmed.length >= 20 && trimmed.length <= 256;
 }
 
 // Mask sensitive strings (show first/last few chars)
